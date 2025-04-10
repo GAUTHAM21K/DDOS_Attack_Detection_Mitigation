@@ -15,7 +15,6 @@ from sklearn.metrics import confusion_matrix, accuracy_score
 from sklearn.preprocessing import StandardScaler
 
 from ryu.lib.packet import packet
-from ryu.lib.packet.stream_parser import StreamParser, TooSmallException
 
 class SimpleMonitor13(switch.SimpleSwitch13):
 
@@ -75,7 +74,7 @@ class SimpleMonitor13(switch.SimpleSwitch13):
                     byte_count_per_second = stat.byte_count / stat.duration_sec if stat.duration_sec else 0
                     byte_count_per_nsecond = stat.byte_count / stat.duration_nsec if stat.duration_nsec else 0
                     file0.write(f"{timestamp},{ev.msg.datapath.id},{flow_id},{ip_src},{tp_src},{ip_dst},{tp_dst},{ip_proto},{icmp_code},{icmp_type},{stat.duration_sec},{stat.duration_nsec},{stat.idle_timeout},{stat.hard_timeout},{stat.flags},{stat.packet_count},{stat.byte_count},{packet_count_per_second},{packet_count_per_nsecond},{byte_count_per_second},{byte_count_per_nsecond}\n")
-                except TooSmallException:
+                except Exception:
                     continue
 
     def flow_training(self):
@@ -139,6 +138,10 @@ class SimpleMonitor13(switch.SimpleSwitch13):
 
             X_predict = predict_df[selected_features].values.astype('float64')
             X_scaled = self.scaler.transform(X_predict)
+
+            if X_scaled.shape[1] != self.flow_model.n_features_in_:
+                self.logger.error("Prediction error: Feature dimension mismatch with the trained model.")
+                return
 
             y_pred = self.flow_model.predict(X_scaled)
             legitimate, ddos = 0, 0
