@@ -96,7 +96,12 @@ class IntegratedMonitor(switch.SimpleSwitch13):
         try:
             predict_flow_dataset = pd.read_csv('PredictFlowStatsfile.csv')
 
-            # Replacing '.' characters in specific columns
+            # Validate dataset
+            if predict_flow_dataset.empty:
+                self.logger.error("PredictFlowStatsfile.csv is empty or invalid.")
+                return
+
+            # Preprocessing
             predict_flow_dataset.iloc[:, 2] = predict_flow_dataset.iloc[:, 2].str.replace('.', '')
             predict_flow_dataset.iloc[:, 3] = predict_flow_dataset.iloc[:, 3].str.replace('.', '')
             predict_flow_dataset.iloc[:, 5] = predict_flow_dataset.iloc[:, 5].str.replace('.', '')
@@ -104,6 +109,7 @@ class IntegratedMonitor(switch.SimpleSwitch13):
             X_predict_flow = predict_flow_dataset.iloc[:, :].values.astype('float64')
             y_flow_pred = self.flow_model.predict(X_predict_flow)
 
+            # Traffic Analysis
             legitimate_traffic = sum(y_flow_pred == 0)
             ddos_traffic = sum(y_flow_pred == 1)
 
@@ -112,11 +118,10 @@ class IntegratedMonitor(switch.SimpleSwitch13):
                 self.logger.info("Traffic is Legitimate!")
             else:
                 self.logger.info("NOTICE!! DoS Attack in Progress!!!")
-                victim = int(predict_flow_dataset.iloc[ddos_traffic - 1, 5]) % 20  # Example victim calculation
+                victim = int(predict_flow_dataset.iloc[ddos_traffic - 1, 5]) % 20
                 self.logger.info("Victim Host: h{}".format(victim))
                 self.mitigation = 1
                 self.logger.info("Mitigation in Progress!")
-
         except Exception as e:
             self.logger.error("Error in flow prediction: {}".format(e))
 
