@@ -99,10 +99,19 @@ class SimpleMonitor13(switch.SimpleSwitch13):
     def flow_predict(self):
         try:
             predict_flow_dataset = pd.read_csv('PredictFlowStatsfile.csv')
+            if predict_flow_dataset.empty:
+                self.logger.warning("No flow stats available for prediction.")
+                return
+
             predict_flow_dataset.iloc[:, 2] = predict_flow_dataset.iloc[:, 2].str.replace('.', '')
             predict_flow_dataset.iloc[:, 3] = predict_flow_dataset.iloc[:, 3].str.replace('.', '')
             predict_flow_dataset.iloc[:, 5] = predict_flow_dataset.iloc[:, 5].str.replace('.', '')
             X_predict_flow = predict_flow_dataset.values.astype('float64')
+
+            if X_predict_flow.shape[0] == 0:
+                self.logger.warning("Predict dataset contains no valid rows after processing.")
+                return
+
             y_flow_pred = self.flow_model.predict(X_predict_flow)
             legitimate_trafic = ddos_trafic = 0
             for idx, label in enumerate(y_flow_pred):
@@ -137,9 +146,8 @@ class SimpleMonitor13(switch.SimpleSwitch13):
         ofproto = dp.ofproto
         parser = dp.ofproto_parser
 
-        # Drop rule for destination IP and port
         match = parser.OFPMatch(eth_type=0x0800, ipv4_dst=victim_ip, tcp_dst=port_no)
-        actions = []  # Drop
+        actions = []
         inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
         mod = parser.OFPFlowMod(datapath=dp, priority=200, match=match, instructions=inst)
         dp.send_msg(mod)
