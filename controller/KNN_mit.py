@@ -20,15 +20,13 @@ class IntegratedMonitor(switch.SimpleSwitch13):
         self.monitor_thread = hub.spawn(self._monitor)
         self.mitigation = 0
 
+        # Train the model
         start = datetime.now()
-
         self.flow_training()
-
         end = datetime.now()
         print("Training time: ", (end - start))
 
-    @set_ev_cls(ofp_event.EventOFPStateChange,
-                [MAIN_DISPATCHER, DEAD_DISPATCHER])
+    @set_ev_cls(ofp_event.EventOFPStateChange, [MAIN_DISPATCHER, DEAD_DISPATCHER])
     def _state_change_handler(self, ev):
         datapath = ev.datapath
         if ev.state == MAIN_DISPATCHER:
@@ -45,30 +43,47 @@ class IntegratedMonitor(switch.SimpleSwitch13):
             for dp in self.datapaths.values():
                 self._request_stats(dp)
             hub.sleep(10)
-
             self.flow_predict()
 
     def _request_stats(self, datapath):
         self.logger.debug('Send stats request: %016x', datapath.id)
         parser = datapath.ofproto_parser
-
         req = parser.OFPFlowStatsRequest(datapath)
         datapath.send_msg(req)
 
     @set_ev_cls(ofp_event.EventOFPFlowStatsReply, MAIN_DISPATCHER)
     def _flow_stats_reply_handler(self, ev):
-        # Handle and save stats as in both codes
-        # (Combine the logic for writing PredictFlowStatsfile.csv if necessary)
+        # Collect and write incoming flow stats to PredictFlowStatsfile.csv
+        timestamp = datetime.now().timestamp()
+        body = ev.msg.body
 
-        # Similar flow-stats processing logic as before
-        pass
+        # Open the file in append mode to log flow statistics
+        with open("PredictFlowStatsfile.csv", "a") as file:
+            for stat in sorted([flow for flow in body if flow.priority == 1], key=lambda flow:
+                               (flow.match.get('ipv4_src', ''), flow.match.get('ipv4_dst', ''))):
+                ip_src = stat.match.get('ipv4_src', '0.0.0.0')
+                ip_dst = stat.match.get('ipv4_dst', '0.0.0.0')
+                ip_proto = stat.match.get('ip_proto', 0)
+                tp_src = stat.match.get('tcp_src', 0) or stat.match.get('udp_src', 0)
+                tp_dst = stat.match.get('tcp_dst', 0) or stat.match.get('udp_dst', 0)
+
+                flow_id = f"{ip_src}{tp_src}{ip_dst}{tp_dst}{ip_proto}"
+
+                try:
+                    packet_count_per_second = stat.packet_count / max(1, stat.duration_sec)
+                    byte_count_per_second = stat.byte_count / max(1, stat.duration_sec)
+                except ZeroDivisionError:
+                    packet_count_per_second = 0
+                    byte_count_per_second = 0
+
+                file.write(f"{timestamp},{ev.msg.datapath.id},{flow_id},{ip_src},{tp_src},{ip_dst},{tp_dst},{ip_proto},"
+                           f"{stat.packet_count},{stat.byte_count},{packet_count_per_second},{byte_count_per_second}\n")
 
     def flow_training(self):
         self.logger.info("Flow Training ...")
 
+        # Load and preprocess training dataset
         flow_dataset = pd.read_csv('FlowStatsfile.csv')
-
-        # Replacing '.' characters in specific columns
         flow_dataset.iloc[:, 2] = flow_dataset.iloc[:, 2].str.replace('.', '')
         flow_dataset.iloc[:, 3] = flow_dataset.iloc[:, 3].str.replace('.', '')
         flow_dataset.iloc[:, 5] = flow_dataset.iloc[:, 5].str.replace('.', '')
@@ -76,8 +91,8 @@ class IntegratedMonitor(switch.SimpleSwitch13):
         X_flow = flow_dataset.iloc[:, :-1].values.astype('float64')
         y_flow = flow_dataset.iloc[:, -1].values
 
+        # Train/test split and train KNN model
         X_flow_train, X_flow_test, y_flow_train, y_flow_test = train_test_split(X_flow, y_flow, test_size=0.25, random_state=0)
-
         classifier = KNeighborsClassifier(n_neighbors=5, metric='minkowski', p=2)
         self.flow_model = classifier.fit(X_flow_train, y_flow_train)
 
@@ -101,7 +116,7 @@ class IntegratedMonitor(switch.SimpleSwitch13):
                 self.logger.error("PredictFlowStatsfile.csv is empty or invalid.")
                 return
 
-            # Preprocessing
+            # Preprocess input data
             predict_flow_dataset.iloc[:, 2] = predict_flow_dataset.iloc[:, 2].str.replace('.', '')
             predict_flow_dataset.iloc[:, 3] = predict_flow_dataset.iloc[:, 3].str.replace('.', '')
             predict_flow_dataset.iloc[:, 5] = predict_flow_dataset.iloc[:, 5].str.replace('.', '')
@@ -109,7 +124,7 @@ class IntegratedMonitor(switch.SimpleSwitch13):
             X_predict_flow = predict_flow_dataset.iloc[:, :].values.astype('float64')
             y_flow_pred = self.flow_model.predict(X_predict_flow)
 
-            # Traffic Analysis
+            # Analyze and detect traffic anomalies
             legitimate_traffic = sum(y_flow_pred == 0)
             ddos_traffic = sum(y_flow_pred == 1)
 
@@ -122,10 +137,11 @@ class IntegratedMonitor(switch.SimpleSwitch13):
                 self.logger.info("Victim Host: h{}".format(victim))
                 self.mitigation = 1
                 self.logger.info("Mitigation in Progress!")
+
         except Exception as e:
             self.logger.error("Error in flow prediction: {}".format(e))
 
         # Reset the file after processing
         open("PredictFlowStatsfile.csv", "w").write(
-            'timestamp,datapath_id,flow_id,ip_src,tp_src,ip_dst,tp_dst,ip_proto,icmp_code,icmp_type,flow_duration_sec,flow_duration_nsec,idle_timeout,hard_timeout,flags,packet_count,byte_count,packet_count_per_second,packet_count_per_nsecond,byte_count_per_second,byte_count_per_nsecond\n'
+            'timestamp,datapath_id,flow_id,ip_src,tp_src,ip_dst,tp_dst,ip_proto,packet_count,byte_count,packet_count_per_second,byte_count_per_second\n'
         )
