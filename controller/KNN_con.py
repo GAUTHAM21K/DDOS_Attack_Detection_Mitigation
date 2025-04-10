@@ -5,12 +5,12 @@ from ryu.lib import hub
 
 import switch
 from datetime import datetime
-
+import os
+import joblib
 import pandas as pd
 from sklearn.model_selection import train_test_split
 from sklearn.neighbors import KNeighborsClassifier
-from sklearn.metrics import confusion_matrix
-from sklearn.metrics import accuracy_score
+from sklearn.metrics import confusion_matrix, accuracy_score
 
 class SimpleMonitor13(switch.SimpleSwitch13):
 
@@ -19,10 +19,15 @@ class SimpleMonitor13(switch.SimpleSwitch13):
         self.datapaths = {}
         self.monitor_thread = hub.spawn(self._monitor)
 
-        start = datetime.now()
-        self.flow_training()
-        end = datetime.now()
-        print("Training time: ", (end-start))
+        if os.path.exists("flow_model.pkl"):
+            self.logger.info("Loading pre-trained model from disk...")
+            self.flow_model = joblib.load("flow_model.pkl")
+        else:
+            start = datetime.now()
+            self.flow_training()
+            joblib.dump(self.flow_model, "flow_model.pkl")
+            end = datetime.now()
+            print("Training time: ", (end-start))
 
     @set_ev_cls(ofp_event.EventOFPStateChange, [MAIN_DISPATCHER, DEAD_DISPATCHER])
     def _state_change_handler(self, ev):
@@ -40,7 +45,7 @@ class SimpleMonitor13(switch.SimpleSwitch13):
         while True:
             for dp in self.datapaths.values():
                 self._request_stats(dp)
-            hub.sleep(10)
+            hub.sleep(2)  # Reduced delay for faster detection
             self.flow_predict()
 
     def _request_stats(self, datapath):
@@ -92,8 +97,7 @@ class SimpleMonitor13(switch.SimpleSwitch13):
         self.logger.info("confusion matrix")
         self.logger.info(confusion_matrix(y_flow_test, y_flow_pred))
         acc = accuracy_score(y_flow_test, y_flow_pred)
-        self.logger.info("succes accuracy = {0:.2f} %".format(acc*100))
-        self.logger.info("fail accuracy = {0:.2f} %".format((1.0 - acc)*100))
+        self.logger.info("accuracy = {0:.2f} %".format(acc*100))
         self.logger.info("------------------------------------------------------------------------------")
 
     def flow_predict(self):
@@ -126,9 +130,9 @@ class SimpleMonitor13(switch.SimpleSwitch13):
 
             self.logger.info("------------------------------------------------------------------------------")
             if (legitimate_trafic / len(y_flow_pred) * 100) > 80:
-                self.logger.info("legitimate trafic ...")
+                self.logger.info("Traffic is legitimate")
             else:
-                self.logger.info("ddos trafic detected and mitigated")
+                self.logger.info("DDoS detected. Mitigation applied.")
             self.logger.info("------------------------------------------------------------------------------")
 
             with open("PredictFlowStatsfile.csv", "w") as file0:
@@ -137,7 +141,7 @@ class SimpleMonitor13(switch.SimpleSwitch13):
             self.logger.error(f"Prediction error: {str(e)}")
 
     def mitigate_attack(self, datapath_id, victim_ip, port_no):
-        self.logger.info(f"Mitigating attack on {victim_ip}:{port_no} at switch {datapath_id}")
+        self.logger.info(f"Blocking port {port_no} on switch {datapath_id} targeting IP {victim_ip}")
         dp = self.datapaths.get(datapath_id)
         if not dp:
             self.logger.warning(f"Datapath {datapath_id} not found")
@@ -152,4 +156,4 @@ class SimpleMonitor13(switch.SimpleSwitch13):
         mod = parser.OFPFlowMod(datapath=dp, priority=200, match=match, instructions=inst)
         dp.send_msg(mod)
 
-        self.logger.info(f"Installed drop rule on switch {datapath_id} for traffic to {victim_ip}:{port_no}")
+        self.logger.info(f"Drop rule installed on switch {datapath_id} for traffic to {victim_ip}:{port_no}")
