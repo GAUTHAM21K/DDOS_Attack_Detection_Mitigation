@@ -7,6 +7,8 @@ import switch
 from datetime import datetime
 
 import pandas as pd
+import joblib
+import os
 from sklearn.model_selection import train_test_split
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.metrics import confusion_matrix
@@ -78,23 +80,30 @@ class SimpleMonitor13(switch.SimpleSwitch13):
 
     def flow_training(self):
         self.logger.info("Flow Training ...")
-        flow_dataset = pd.read_csv('FlowStatsfile.csv')
-        flow_dataset.iloc[:, 2] = flow_dataset.iloc[:, 2].str.replace('.', '')
-        flow_dataset.iloc[:, 3] = flow_dataset.iloc[:, 3].str.replace('.', '')
-        flow_dataset.iloc[:, 5] = flow_dataset.iloc[:, 5].str.replace('.', '')
-        X_flow = flow_dataset.iloc[:, :-1].values.astype('float64')
-        y_flow = flow_dataset.iloc[:, -1].values
-        X_flow_train, X_flow_test, y_flow_train, y_flow_test = train_test_split(X_flow, y_flow, test_size=0.25, random_state=0)
-        classifier = KNeighborsClassifier(n_neighbors=5, metric='minkowski', p=2)
-        self.flow_model = classifier.fit(X_flow_train, y_flow_train)
-        y_flow_pred = self.flow_model.predict(X_flow_test)
-        self.logger.info("------------------------------------------------------------------------------")
-        self.logger.info("confusion matrix")
-        self.logger.info(confusion_matrix(y_flow_test, y_flow_pred))
-        acc = accuracy_score(y_flow_test, y_flow_pred)
-        self.logger.info("succes accuracy = {0:.2f} %".format(acc*100))
-        self.logger.info("fail accuracy = {0:.2f} %".format((1.0 - acc)*100))
-        self.logger.info("------------------------------------------------------------------------------")
+        model_path = "knn_model.pkl"
+        scaler_path = "flow_scaler.pkl"
+        if os.path.exists(model_path):
+            self.flow_model = joblib.load(model_path)
+            self.logger.info("Loaded trained model from disk.")
+        else:
+            flow_dataset = pd.read_csv('FlowStatsfile.csv')
+            flow_dataset.iloc[:, 2] = flow_dataset.iloc[:, 2].str.replace('.', '')
+            flow_dataset.iloc[:, 3] = flow_dataset.iloc[:, 3].str.replace('.', '')
+            flow_dataset.iloc[:, 5] = flow_dataset.iloc[:, 5].str.replace('.', '')
+            X_flow = flow_dataset.iloc[:, :-1].values.astype('float64')
+            y_flow = flow_dataset.iloc[:, -1].values
+            X_flow_train, X_flow_test, y_flow_train, y_flow_test = train_test_split(X_flow, y_flow, test_size=0.25, random_state=0)
+            classifier = KNeighborsClassifier(n_neighbors=5, metric='minkowski', p=2)
+            self.flow_model = classifier.fit(X_flow_train, y_flow_train)
+            joblib.dump(self.flow_model, model_path)
+            y_flow_pred = self.flow_model.predict(X_flow_test)
+            self.logger.info("------------------------------------------------------------------------------")
+            self.logger.info("confusion matrix")
+            self.logger.info(confusion_matrix(y_flow_test, y_flow_pred))
+            acc = accuracy_score(y_flow_test, y_flow_pred)
+            self.logger.info("succes accuracy = {0:.2f} %".format(acc*100))
+            self.logger.info("fail accuracy = {0:.2f} %".format((1.0 - acc)*100))
+            self.logger.info("------------------------------------------------------------------------------")
 
     def flow_predict(self):
         try:
