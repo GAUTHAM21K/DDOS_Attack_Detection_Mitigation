@@ -23,10 +23,13 @@ class SimpleMonitor13(switch.SimpleSwitch13):
         self.datapaths = {}
         self.monitor_thread = hub.spawn(self._monitor)
 
-        start = datetime.now()
-        self.flow_training()
-        end = datetime.now()
-        print("Training time: ", (end-start))
+        try:
+            start = datetime.now()
+            self.flow_training()
+            end = datetime.now()
+            self.logger.info(f"Training time: {end - start}")
+        except Exception as e:
+            self.logger.error(f"Error during training: {str(e)}")
 
     @set_ev_cls(ofp_event.EventOFPStateChange, [MAIN_DISPATCHER, DEAD_DISPATCHER])
     def _state_change_handler(self, ev):
@@ -92,6 +95,9 @@ class SimpleMonitor13(switch.SimpleSwitch13):
             self.scaler = joblib.load(scaler_path)
             self.logger.info("Loaded trained model from disk.")
         else:
+            if not os.path.exists('FlowStatsfile.csv'):
+                raise FileNotFoundError("Training data file 'FlowStatsfile.csv' not found.")
+
             flow_dataset = pd.read_csv('FlowStatsfile.csv')
             flow_dataset['ip_src'] = flow_dataset['ip_src'].str.replace('.', '')
             flow_dataset['ip_dst'] = flow_dataset['ip_dst'].str.replace('.', '')
