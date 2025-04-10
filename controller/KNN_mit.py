@@ -8,25 +8,25 @@ from datetime import datetime
 
 import pandas as pd
 from sklearn.model_selection import train_test_split
-from sklearn.neighbors import KNeighborsClassifier
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import confusion_matrix
 from sklearn.metrics import accuracy_score
 
-class IntegratedMonitor(switch.SimpleSwitch13):
+
+class SimpleMonitor13(switch.SimpleSwitch13):
 
     def __init__(self, *args, **kwargs):
-        super(IntegratedMonitor, self).__init__(*args, **kwargs)
-        self.datapaths = {}  # Dictionary to track registered datapaths
-        self.monitor_thread = hub.spawn(self._monitor)  # Thread for periodic monitoring
-        self.mitigation = 0  # Indicator for ongoing mitigation
+        super(SimpleMonitor13, self).__init__(*args, **kwargs)
+        self.datapaths = {}
+        self.monitor_thread = hub.spawn(self._monitor)
+        self.mitigation = 0  # Flag for mitigation
 
-        # Train the model
+        # Train the Random Forest model
         start = datetime.now()
         self.flow_training()
         end = datetime.now()
         print("Training time: ", (end - start))
 
-    # Handler for datapath state changes
     @set_ev_cls(ofp_event.EventOFPStateChange, [MAIN_DISPATCHER, DEAD_DISPATCHER])
     def _state_change_handler(self, ev):
         datapath = ev.datapath
@@ -39,25 +39,22 @@ class IntegratedMonitor(switch.SimpleSwitch13):
                 self.logger.debug('Unregister datapath: %016x', datapath.id)
                 del self.datapaths[datapath.id]
 
-    # Periodic monitoring of flow stats
     def _monitor(self):
         while True:
             for dp in self.datapaths.values():
                 self._request_stats(dp)
-            hub.sleep(10)  # Pause 10 seconds before the next monitoring cycle
+            hub.sleep(10)  # Pause for 10 seconds before the next monitoring cycle
             self.flow_predict()
 
-    # Request flow statistics from a datapath
     def _request_stats(self, datapath):
         self.logger.debug('Send stats request: %016x', datapath.id)
         parser = datapath.ofproto_parser
         req = parser.OFPFlowStatsRequest(datapath)
         datapath.send_msg(req)
 
-    # Handler for incoming flow stats and writing them to the file
     @set_ev_cls(ofp_event.EventOFPFlowStatsReply, MAIN_DISPATCHER)
     def _flow_stats_reply_handler(self, ev):
-        # Collect flow stats and write them to PredictFlowStatsfile.csv
+        # Collect and write incoming flow stats to PredictFlowStatsfile.csv
         timestamp = datetime.now().timestamp()
         body = ev.msg.body
 
@@ -78,4 +75,84 @@ class IntegratedMonitor(switch.SimpleSwitch13):
                     packet_count_per_second = stat.packet_count / max(1, stat.duration_sec)
                     byte_count_per_second = stat.byte_count / max(1, stat.duration_sec)
                 except ZeroDivisionError:
-                   
+                    packet_count_per_second = 0
+                    byte_count_per_second = 0
+
+                # Write flow statistics to the file
+                file.write(f"{timestamp},{ev.msg.datapath.id},{flow_id},{ip_src},{tp_src},{ip_dst},{tp_dst},{ip_proto},"
+                           f"{stat.packet_count},{stat.byte_count},{packet_count_per_second},{byte_count_per_second}\n")
+
+    def flow_training(self):
+        self.logger.info("Flow Training ...")
+
+        # Load and preprocess training dataset
+        flow_dataset = pd.read_csv('FlowStatsfile.csv')
+        flow_dataset.iloc[:, 2] = flow_dataset.iloc[:, 2].str.replace('.', '')
+        flow_dataset.iloc[:, 3] = flow_dataset.iloc[:, 3].str.replace('.', '')
+        flow_dataset.iloc[:, 5] = flow_dataset.iloc[:, 5].str.replace('.', '')
+
+        X_flow = flow_dataset.iloc[:, :-1].values.astype('float64')
+        y_flow = flow_dataset.iloc[:, -1].values
+
+        # Train/test split and train Random Forest model
+        X_flow_train, X_flow_test, y_flow_train, y_flow_test = train_test_split(X_flow, y_flow, test_size=0.25, random_state=0)
+        classifier = RandomForestClassifier(n_estimators=10, criterion="entropy", random_state=0)
+        self.flow_model = classifier.fit(X_flow_train, y_flow_train)
+
+        # Evaluate model
+        y_flow_pred = self.flow_model.predict(X_flow_test)
+        self.logger.info("Confusion Matrix:")
+        cm = confusion_matrix(y_flow_test, y_flow_pred)
+        self.logger.info(cm)
+
+        acc = accuracy_score(y_flow_test, y_flow_pred)
+        self.logger.info("Success Accuracy = {0:.2f}%".format(acc * 100))
+        fail = 1.0 - acc
+        self.logger.info("Fail Accuracy = {0:.2f}%".format(fail * 100))
+
+    def flow_predict(self):
+        try:
+            # Load the CSV file
+            predict_flow_dataset = pd.read_csv('PredictFlowStatsfile.csv')
+
+            # Validate dataset
+            if predict_flow_dataset.empty:
+                self.logger.error("PredictFlowStatsfile.csv is empty or invalid.")
+                return
+
+            # Preprocess the dataset
+            predict_flow_dataset.iloc[:, 2] = predict_flow_dataset.iloc[:, 2].str.replace('.', '')
+            predict_flow_dataset.iloc[:, 3] = predict_flow_dataset.iloc[:, 3].str.replace('.', '')
+            predict_flow_dataset.iloc[:, 5] = predict_flow_dataset.iloc[:, 5].str.replace('.', '')
+
+            # Convert to NumPy array and predict
+            X_predict_flow = predict_flow_dataset.iloc[:, :].values.astype('float64')
+            y_flow_pred = self.flow_model.predict(X_predict_flow)
+
+            # Analyze prediction results
+            legitimate_traffic = sum(y_flow_pred == 0)
+            ddos_traffic = sum(y_flow_pred == 1)
+
+            self.logger.info("Traffic Analysis:")
+            if (legitimate_traffic / len(y_flow_pred) * 100) > 80:
+                self.logger.info("Traffic is Legitimate!")
+            else:
+                self.logger.info("NOTICE!! DoS Attack in Progress!!!")
+                victim_index = y_flow_pred.tolist().index(1)  # Find the first occurrence of malicious traffic
+                victim = int(predict_flow_dataset.iloc[victim_index, 5]) % 20
+                self.logger.info("Victim Host: h{}".format(victim))
+                self.mitigation = 1
+                self.logger.info("Mitigation in Progress!")
+
+        except Exception as e:
+            # Log any errors during prediction
+            self.logger.error("Error in flow prediction: {}".format(e))
+
+        finally:
+            # Reset the file for the next monitoring cycle
+            with open("PredictFlowStatsfile.csv", "w") as file0:
+                file0.write(
+                    'timestamp,datapath_id,flow_id,ip_src,tp_src,ip_dst,tp_dst,ip_proto,icmp_code,icmp_type,'
+                    'flow_duration_sec,flow_duration_nsec,idle_timeout,hard_timeout,flags,packet_count,byte_count,'
+                    'packet_count_per_second,packet_count_per_nsecond,byte_count_per_second,byte_count_per_nsecond\n'
+                )
