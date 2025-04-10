@@ -13,11 +13,17 @@ from sklearn.neighbors import KNeighborsClassifier
 from sklearn.metrics import confusion_matrix
 from sklearn.metrics import accuracy_score
 import logging
+import sys
 
-# Suppress specific Ryu errors
-logging.getLogger("ryu.lib.packet.packet").setLevel(logging.ERROR)
-logging.getLogger("ryu.lib.packet.bgp").setLevel(logging.ERROR)
-logging.getLogger("ryu.base.app_manager").setLevel(logging.ERROR)
+# Custom logger to filter out specific error messages
+class ErrorFilter(logging.Filter):
+    def filter(self, record):
+        # Filter out the specific BGP error
+        return "ryu.lib.packet.bgp" not in record.getMessage() and "120 < 22616" not in record.getMessage()
+
+# Configure root logger with our filter
+root_logger = logging.getLogger()
+root_logger.addFilter(ErrorFilter())
 
 class SimpleMonitor13(switch.SimpleSwitch13):
 
@@ -36,14 +42,8 @@ class SimpleMonitor13(switch.SimpleSwitch13):
         # Start monitoring thread after model is trained
         self.monitor_thread = hub.spawn(self._monitor)
 
-    # Override the packet_in_handler to suppress the specific error
-    def _packet_in_handler(self, ev):
-        try:
-            # Call the parent class method
-            super(SimpleMonitor13, self)._packet_in_handler(ev)
-        except Exception:
-            # Silently handle the exception that's causing the error
-            pass
+    # We're NOT overriding packet_in_handler now - let it process normally
+    # This ensures packet processing still works, we're just filtering errors
 
     @set_ev_cls(ofp_event.EventOFPStateChange,
                 [MAIN_DISPATCHER, DEAD_DISPATCHER])
@@ -67,14 +67,14 @@ class SimpleMonitor13(switch.SimpleSwitch13):
             for dp in self.datapaths.values():
                 self._request_stats(dp)
             
-            # Give time for stats to be collected
-            hub.sleep(3)  # Reduced further for faster processing
+            # Give time for stats to be collected - not too short
+            hub.sleep(5)  # 5 seconds should be sufficient for stats collection
             
             # Only predict if we've collected some data
             if self.flow_stats_buffer:
                 self.flow_predict()
             else:
-                self.logger.debug('No flow stats collected, skipping prediction')
+                self.logger.info('No flow stats collected, checking again soon')
 
     def _request_stats(self, datapath):
         self.logger.debug('send stats request: %016x', datapath.id)
@@ -87,6 +87,10 @@ class SimpleMonitor13(switch.SimpleSwitch13):
         timestamp = datetime.now().timestamp()
         body = ev.msg.body
         
+        # Log how many flows we're processing to help with debugging
+        self.logger.info(f"Processing {len(body)} flows from datapath {ev.msg.datapath.id}")
+        
+        flows_processed = 0
         for stat in sorted([flow for flow in body if (flow.priority == 1)], key=lambda flow:
             (flow.match['eth_type'], flow.match['ipv4_src'], flow.match['ipv4_dst'], flow.match['ip_proto'])):
             
@@ -96,6 +100,10 @@ class SimpleMonitor13(switch.SimpleSwitch13):
                 icmp_type = -1
                 tp_src = 0
                 tp_dst = 0
+                
+                # Extract match fields carefully
+                if 'ipv4_src' not in stat.match or 'ipv4_dst' not in stat.match or 'ip_proto' not in stat.match:
+                    continue  # Skip if missing required fields
                 
                 ip_src = stat.match['ipv4_src']
                 ip_dst = stat.match['ipv4_dst']
@@ -111,25 +119,28 @@ class SimpleMonitor13(switch.SimpleSwitch13):
                     tp_src = stat.match.get('udp_src', 0)
                     tp_dst = stat.match.get('udp_dst', 0)
 
-                flow_id = f"{ip_src}{tp_src}{ip_dst}{tp_dst}{ip_proto}".replace('.', '')
+                # Remove dots from IP addresses in flow_id
+                ip_src_clean = str(ip_src).replace('.', '')
+                ip_dst_clean = str(ip_dst).replace('.', '')
+                flow_id = f"{ip_src_clean}{tp_src}{ip_dst_clean}{tp_dst}{ip_proto}"
                 
                 # Avoid division by zero
-                duration_sec = stat.duration_sec if stat.duration_sec > 0 else 1
-                duration_nsec = stat.duration_nsec if stat.duration_nsec > 0 else 1
+                duration_sec = max(stat.duration_sec, 1)  # Ensure at least 1 second
+                duration_nsec = max(stat.duration_nsec, 1)  # Ensure at least 1 nanosecond
                 
                 packet_count_per_second = stat.packet_count / duration_sec
                 packet_count_per_nsecond = stat.packet_count / duration_nsec
                 byte_count_per_second = stat.byte_count / duration_sec
                 byte_count_per_nsecond = stat.byte_count / duration_nsec
                 
-                # Store in buffer instead of writing to file immediately
+                # Store in buffer instead of writing to file
                 self.flow_stats_buffer.append({
                     'timestamp': timestamp,
                     'datapath_id': ev.msg.datapath.id,
                     'flow_id': flow_id,
-                    'ip_src': ip_src.replace('.', ''),
+                    'ip_src': ip_src_clean,
                     'tp_src': tp_src,
-                    'ip_dst': ip_dst.replace('.', ''),
+                    'ip_dst': ip_dst_clean,
                     'tp_dst': tp_dst,
                     'ip_proto': ip_proto,
                     'icmp_code': icmp_code,
@@ -146,9 +157,14 @@ class SimpleMonitor13(switch.SimpleSwitch13):
                     'byte_count_per_second': byte_count_per_second,
                     'byte_count_per_nsecond': byte_count_per_nsecond
                 })
-            except Exception:
-                # Silently handle any exceptions that might occur during stat processing
-                pass
+                flows_processed += 1
+                
+            except Exception as e:
+                # Log the exception but don't display it to console
+                self.logger.debug(f"Error processing flow: {str(e)}")
+                continue
+        
+        self.logger.info(f"Successfully processed {flows_processed} flows")
 
     def flow_training(self):
         self.logger.info("Flow Training ...")
@@ -161,6 +177,8 @@ class SimpleMonitor13(switch.SimpleSwitch13):
             if flow_dataset.empty:
                 self.logger.error("Training dataset is empty!")
                 return
+            
+            self.logger.info(f"Loaded training dataset with {len(flow_dataset)} records")
                 
             # Preprocess data - remove dots from IP addresses
             flow_dataset['flow_id'] = flow_dataset['flow_id'].astype(str).str.replace('.', '')
@@ -202,7 +220,7 @@ class SimpleMonitor13(switch.SimpleSwitch13):
         try:
             # Skip prediction if buffer is empty
             if not self.flow_stats_buffer:
-                self.logger.debug("No flow stats to predict")
+                self.logger.info("No flow stats to predict")
                 return
                 
             # Convert buffer to DataFrame
@@ -210,8 +228,24 @@ class SimpleMonitor13(switch.SimpleSwitch13):
             
             # Skip prediction if DataFrame is empty after conversion
             if predict_flow_dataset.empty:
-                self.logger.debug("Empty dataset after conversion, skipping prediction")
+                self.logger.info("Empty dataset after conversion, skipping prediction")
                 return
+            
+            self.logger.info(f"Predicting on {len(predict_flow_dataset)} flow records")
+                
+            # Ensure all expected columns are present
+            required_columns = [
+                'timestamp', 'datapath_id', 'flow_id', 'ip_src', 'tp_src', 'ip_dst', 
+                'tp_dst', 'ip_proto', 'icmp_code', 'icmp_type', 'flow_duration_sec', 'flow_duration_nsec',
+                'idle_timeout', 'hard_timeout', 'flags', 'packet_count', 'byte_count',
+                'packet_count_per_second', 'packet_count_per_nsecond', 'byte_count_per_second', 'byte_count_per_nsecond'
+            ]
+            
+            # Check if all required columns are in the DataFrame
+            for col in required_columns:
+                if col not in predict_flow_dataset.columns:
+                    self.logger.error(f"Missing column: {col} in prediction data")
+                    return
                 
             # Convert to numpy array
             X_predict_flow = predict_flow_dataset.values.astype('float64')
@@ -237,13 +271,19 @@ class SimpleMonitor13(switch.SimpleSwitch13):
                         # Extract victim IP from the DataFrame
                         victim_ip = predict_flow_dataset.iloc[i]['ip_dst']
                         # Get the last octet which usually identifies the host in a subnet
-                        victim_id = int(victim_ip) % 100
-                        
-                        # Count occurrences of each victim
-                        if victim_id in victim_hosts:
-                            victim_hosts[victim_id] += 1
-                        else:
-                            victim_hosts[victim_id] = 1
+                        try:
+                            victim_id = int(str(victim_ip)[-2:]) % 20  # Last 2 digits mod 20
+                            if victim_id == 0:
+                                victim_id = 20  # Map 0 to 20 for host naming
+                                
+                            # Count occurrences of each victim
+                            if victim_id in victim_hosts:
+                                victim_hosts[victim_id] += 1
+                            else:
+                                victim_hosts[victim_id] = 1
+                        except ValueError:
+                            # If we can't parse the IP properly, just continue
+                            continue
             
             # Log results
             self.logger.info("------------------------------------------------------------------------------")
@@ -260,13 +300,24 @@ class SimpleMonitor13(switch.SimpleSwitch13):
                 if victim_hosts:
                     most_targeted = max(victim_hosts.items(), key=lambda x: x[1])
                     self.logger.info(f"Most targeted victim is host: h{most_targeted[0]} (targeted {most_targeted[1]} times)")
+                else:
+                    self.logger.info("Could not determine the specific victim")
             
             self.logger.info("------------------------------------------------------------------------------")
+            
+            # Write to file for debugging if needed
+            with open("detection_results.txt", "a") as f:
+                f.write(f"{datetime.now()} - Legitimate: {legitimate_percentage:.2f}%, DDoS: {100-legitimate_percentage:.2f}%\n")
             
             # Clear buffer after prediction
             self.flow_stats_buffer = []
             
         except Exception as e:
-            # Just log at debug level to prevent console clutter
-            self.logger.debug(f"Error during prediction: {str(e)}")
+            # Log the exception but keep it at info level
+            self.logger.info(f"Error during prediction: {str(e)}")
+            # For debugging, write stack trace to file but not console
+            import traceback
+            with open("error_log.txt", "a") as f:
+                f.write(f"{datetime.now()} - {str(e)}\n")
+                f.write(traceback.format_exc())
             # Don't clear buffer so we can debug if needed
