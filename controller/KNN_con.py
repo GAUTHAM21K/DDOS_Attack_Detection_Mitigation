@@ -11,8 +11,10 @@ import joblib
 import os
 from sklearn.model_selection import train_test_split
 from sklearn.neighbors import KNeighborsClassifier
-from sklearn.metrics import confusion_matrix
-from sklearn.metrics import accuracy_score
+from sklearn.metrics import confusion_matrix, accuracy_score
+
+from ryu.lib.packet import packet
+from ryu.lib.packet.stream_parser import StreamParser
 
 class SimpleMonitor13(switch.SimpleSwitch13):
 
@@ -81,72 +83,88 @@ class SimpleMonitor13(switch.SimpleSwitch13):
     def flow_training(self):
         self.logger.info("Flow Training ...")
         model_path = "knn_model.pkl"
-        scaler_path = "flow_scaler.pkl"
+        selected_features = ['timestamp', 'ip_src', 'tp_src', 'ip_dst', 'tp_dst', 'ip_proto',
+                             'icmp_code', 'icmp_type', 'flow_duration_sec', 'flow_duration_nsec',
+                             'idle_timeout', 'hard_timeout', 'flags', 'packet_count', 'byte_count',
+                             'packet_count_per_second', 'packet_count_per_nsecond',
+                             'byte_count_per_second', 'byte_count_per_nsecond']
+
         if os.path.exists(model_path):
             self.flow_model = joblib.load(model_path)
             self.logger.info("Loaded trained model from disk.")
         else:
             flow_dataset = pd.read_csv('FlowStatsfile.csv')
-            flow_dataset.iloc[:, 2] = flow_dataset.iloc[:, 2].str.replace('.', '')
-            flow_dataset.iloc[:, 3] = flow_dataset.iloc[:, 3].str.replace('.', '')
-            flow_dataset.iloc[:, 5] = flow_dataset.iloc[:, 5].str.replace('.', '')
-            X_flow = flow_dataset.iloc[:, :-1].values.astype('float64')
+            flow_dataset['ip_src'] = flow_dataset['ip_src'].str.replace('.', '')
+            flow_dataset['ip_dst'] = flow_dataset['ip_dst'].str.replace('.', '')
+            flow_dataset['tp_src'] = flow_dataset['tp_src'].astype(str)
+            flow_dataset['tp_dst'] = flow_dataset['tp_dst'].astype(str)
+
+            X_flow = flow_dataset[selected_features].values.astype('float64')
             y_flow = flow_dataset.iloc[:, -1].values
-            X_flow_train, X_flow_test, y_flow_train, y_flow_test = train_test_split(X_flow, y_flow, test_size=0.25, random_state=0)
+            X_train, X_test, y_train, y_test = train_test_split(X_flow, y_flow, test_size=0.25, random_state=0)
             classifier = KNeighborsClassifier(n_neighbors=5, metric='minkowski', p=2)
-            self.flow_model = classifier.fit(X_flow_train, y_flow_train)
+            self.flow_model = classifier.fit(X_train, y_train)
             joblib.dump(self.flow_model, model_path)
-            y_flow_pred = self.flow_model.predict(X_flow_test)
+            y_pred = self.flow_model.predict(X_test)
+            acc = accuracy_score(y_test, y_pred)
             self.logger.info("------------------------------------------------------------------------------")
             self.logger.info("confusion matrix")
-            self.logger.info(confusion_matrix(y_flow_test, y_flow_pred))
-            acc = accuracy_score(y_flow_test, y_flow_pred)
-            self.logger.info("succes accuracy = {0:.2f} %".format(acc*100))
+            self.logger.info(confusion_matrix(y_test, y_pred))
+            self.logger.info("success accuracy = {0:.2f} %".format(acc*100))
             self.logger.info("fail accuracy = {0:.2f} %".format((1.0 - acc)*100))
             self.logger.info("------------------------------------------------------------------------------")
 
     def flow_predict(self):
         try:
-            predict_flow_dataset = pd.read_csv('PredictFlowStatsfile.csv')
-            if predict_flow_dataset.empty:
+            selected_features = ['timestamp', 'ip_src', 'tp_src', 'ip_dst', 'tp_dst', 'ip_proto',
+                                 'icmp_code', 'icmp_type', 'flow_duration_sec', 'flow_duration_nsec',
+                                 'idle_timeout', 'hard_timeout', 'flags', 'packet_count', 'byte_count',
+                                 'packet_count_per_second', 'packet_count_per_nsecond',
+                                 'byte_count_per_second', 'byte_count_per_nsecond']
+
+            predict_df = pd.read_csv('PredictFlowStatsfile.csv')
+            if predict_df.empty:
                 self.logger.warning("No flow stats available for prediction.")
                 return
 
-            predict_flow_dataset.iloc[:, 2] = predict_flow_dataset.iloc[:, 2].str.replace('.', '')
-            predict_flow_dataset.iloc[:, 3] = predict_flow_dataset.iloc[:, 3].str.replace('.', '')
-            predict_flow_dataset.iloc[:, 5] = predict_flow_dataset.iloc[:, 5].str.replace('.', '')
-            X_predict_flow = predict_flow_dataset.values.astype('float64')
+            predict_df['ip_src'] = predict_df['ip_src'].str.replace('.', '')
+            predict_df['ip_dst'] = predict_df['ip_dst'].str.replace('.', '')
+            predict_df['tp_src'] = predict_df['tp_src'].astype(str)
+            predict_df['tp_dst'] = predict_df['tp_dst'].astype(str)
 
-            if X_predict_flow.shape[0] == 0:
+            X_predict = predict_df[selected_features].values.astype('float64')
+
+            if len(X_predict) == 0:
                 self.logger.warning("Predict dataset contains no valid rows after processing.")
                 return
 
-            y_flow_pred = self.flow_model.predict(X_predict_flow)
-            legitimate_trafic = ddos_trafic = 0
-            for idx, label in enumerate(y_flow_pred):
+            y_pred = self.flow_model.predict(X_predict)
+            legitimate, ddos = 0, 0
+
+            for i, label in enumerate(y_pred):
                 if label == 0:
-                    legitimate_trafic += 1
+                    legitimate += 1
                 else:
-                    ddos_trafic += 1
-                    datapath_id = int(predict_flow_dataset.iloc[idx, 1])
-                    victim_ip = predict_flow_dataset.iloc[idx, 5]
-                    attacked_port = int(predict_flow_dataset.iloc[idx, 6])
-                    self.mitigate_attack(datapath_id, victim_ip, attacked_port)
+                    ddos += 1
+                    dpid = int(predict_df.iloc[i, 1])
+                    victim_ip = predict_df.iloc[i, 5]
+                    attacked_port = int(predict_df.iloc[i, 6])
+                    self.mitigate_attack(dpid, victim_ip, attacked_port)
 
             self.logger.info("------------------------------------------------------------------------------")
-            if (legitimate_trafic / len(y_flow_pred) * 100) > 80:
-                self.logger.info("legitimate trafic ...")
+            if (legitimate / len(y_pred)) * 100 > 80:
+                self.logger.info("Legitimate traffic detected.")
             else:
-                self.logger.info("ddos trafic detected and mitigated")
+                self.logger.info("DDoS detected. Mitigation rules applied.")
             self.logger.info("------------------------------------------------------------------------------")
 
-            with open("PredictFlowStatsfile.csv", "w") as file0:
-                file0.write('timestamp,datapath_id,flow_id,ip_src,tp_src,ip_dst,tp_dst,ip_proto,icmp_code,icmp_type,flow_duration_sec,flow_duration_nsec,idle_timeout,hard_timeout,flags,packet_count,byte_count,packet_count_per_second,packet_count_per_nsecond,byte_count_per_second,byte_count_per_nsecond\n')
+            open("PredictFlowStatsfile.csv", "w").write('timestamp,datapath_id,flow_id,ip_src,tp_src,ip_dst,tp_dst,ip_proto,icmp_code,icmp_type,flow_duration_sec,flow_duration_nsec,idle_timeout,hard_timeout,flags,packet_count,byte_count,packet_count_per_second,packet_count_per_nsecond,byte_count_per_second,byte_count_per_nsecond\n')
+
         except Exception as e:
             self.logger.error(f"Prediction error: {str(e)}")
 
     def mitigate_attack(self, datapath_id, victim_ip, port_no):
-        self.logger.info(f"Mitigating attack on {victim_ip}:{port_no} at switch {datapath_id}")
+        self.logger.info(f"Blocking traffic to {victim_ip}:{port_no} on switch {datapath_id}")
         dp = self.datapaths.get(datapath_id)
         if not dp:
             self.logger.warning(f"Datapath {datapath_id} not found")
@@ -154,11 +172,9 @@ class SimpleMonitor13(switch.SimpleSwitch13):
 
         ofproto = dp.ofproto
         parser = dp.ofproto_parser
-
         match = parser.OFPMatch(eth_type=0x0800, ipv4_dst=victim_ip, tcp_dst=port_no)
         actions = []
         inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
         mod = parser.OFPFlowMod(datapath=dp, priority=200, match=match, instructions=inst)
         dp.send_msg(mod)
-
-        self.logger.info(f"Installed drop rule on switch {datapath_id} for traffic to {victim_ip}:{port_no}")
+        self.logger.info(f"Drop rule installed on {victim_ip}:{port_no} at switch {datapath_id}")
