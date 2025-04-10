@@ -16,9 +16,9 @@ class IntegratedMonitor(switch.SimpleSwitch13):
 
     def __init__(self, *args, **kwargs):
         super(IntegratedMonitor, self).__init__(*args, **kwargs)
-        self.datapaths = {}
-        self.monitor_thread = hub.spawn(self._monitor)
-        self.mitigation = 0
+        self.datapaths = {}  # Dictionary to track registered datapaths
+        self.monitor_thread = hub.spawn(self._monitor)  # Thread for periodic monitoring
+        self.mitigation = 0  # Indicator for ongoing mitigation
 
         # Train the model
         start = datetime.now()
@@ -26,6 +26,7 @@ class IntegratedMonitor(switch.SimpleSwitch13):
         end = datetime.now()
         print("Training time: ", (end - start))
 
+    # Handler for datapath state changes
     @set_ev_cls(ofp_event.EventOFPStateChange, [MAIN_DISPATCHER, DEAD_DISPATCHER])
     def _state_change_handler(self, ev):
         datapath = ev.datapath
@@ -38,29 +39,33 @@ class IntegratedMonitor(switch.SimpleSwitch13):
                 self.logger.debug('Unregister datapath: %016x', datapath.id)
                 del self.datapaths[datapath.id]
 
+    # Periodic monitoring of flow stats
     def _monitor(self):
         while True:
             for dp in self.datapaths.values():
                 self._request_stats(dp)
-            hub.sleep(10)
+            hub.sleep(10)  # Pause 10 seconds before the next monitoring cycle
             self.flow_predict()
 
+    # Request flow statistics from a datapath
     def _request_stats(self, datapath):
         self.logger.debug('Send stats request: %016x', datapath.id)
         parser = datapath.ofproto_parser
         req = parser.OFPFlowStatsRequest(datapath)
         datapath.send_msg(req)
 
+    # Handler for incoming flow stats and writing them to the file
     @set_ev_cls(ofp_event.EventOFPFlowStatsReply, MAIN_DISPATCHER)
     def _flow_stats_reply_handler(self, ev):
-        # Collect and write incoming flow stats to PredictFlowStatsfile.csv
+        # Collect flow stats and write them to PredictFlowStatsfile.csv
         timestamp = datetime.now().timestamp()
         body = ev.msg.body
 
-        # Open the file in append mode to log flow statistics
+        # Open file for writing data
         with open("PredictFlowStatsfile.csv", "a") as file:
             for stat in sorted([flow for flow in body if flow.priority == 1], key=lambda flow:
                                (flow.match.get('ipv4_src', ''), flow.match.get('ipv4_dst', ''))):
+                # Extract flow attributes
                 ip_src = stat.match.get('ipv4_src', '0.0.0.0')
                 ip_dst = stat.match.get('ipv4_dst', '0.0.0.0')
                 ip_proto = stat.match.get('ip_proto', 0)
@@ -73,75 +78,4 @@ class IntegratedMonitor(switch.SimpleSwitch13):
                     packet_count_per_second = stat.packet_count / max(1, stat.duration_sec)
                     byte_count_per_second = stat.byte_count / max(1, stat.duration_sec)
                 except ZeroDivisionError:
-                    packet_count_per_second = 0
-                    byte_count_per_second = 0
-
-                file.write(f"{timestamp},{ev.msg.datapath.id},{flow_id},{ip_src},{tp_src},{ip_dst},{tp_dst},{ip_proto},"
-                           f"{stat.packet_count},{stat.byte_count},{packet_count_per_second},{byte_count_per_second}\n")
-
-    def flow_training(self):
-        self.logger.info("Flow Training ...")
-
-        # Load and preprocess training dataset
-        flow_dataset = pd.read_csv('FlowStatsfile.csv')
-        flow_dataset.iloc[:, 2] = flow_dataset.iloc[:, 2].str.replace('.', '')
-        flow_dataset.iloc[:, 3] = flow_dataset.iloc[:, 3].str.replace('.', '')
-        flow_dataset.iloc[:, 5] = flow_dataset.iloc[:, 5].str.replace('.', '')
-
-        X_flow = flow_dataset.iloc[:, :-1].values.astype('float64')
-        y_flow = flow_dataset.iloc[:, -1].values
-
-        # Train/test split and train KNN model
-        X_flow_train, X_flow_test, y_flow_train, y_flow_test = train_test_split(X_flow, y_flow, test_size=0.25, random_state=0)
-        classifier = KNeighborsClassifier(n_neighbors=5, metric='minkowski', p=2)
-        self.flow_model = classifier.fit(X_flow_train, y_flow_train)
-
-        y_flow_pred = self.flow_model.predict(X_flow_test)
-
-        self.logger.info("Confusion Matrix:")
-        cm = confusion_matrix(y_flow_test, y_flow_pred)
-        self.logger.info(cm)
-
-        acc = accuracy_score(y_flow_test, y_flow_pred)
-        self.logger.info("Success Accuracy = {0:.2f}%".format(acc * 100))
-        fail = 1.0 - acc
-        self.logger.info("Fail Accuracy = {0:.2f}%".format(fail * 100))
-
-    def flow_predict(self):
-        try:
-            predict_flow_dataset = pd.read_csv('PredictFlowStatsfile.csv')
-
-            # Validate dataset
-            if predict_flow_dataset.empty:
-                self.logger.error("PredictFlowStatsfile.csv is empty or invalid.")
-                return
-
-            # Preprocess input data
-            predict_flow_dataset.iloc[:, 2] = predict_flow_dataset.iloc[:, 2].str.replace('.', '')
-            predict_flow_dataset.iloc[:, 3] = predict_flow_dataset.iloc[:, 3].str.replace('.', '')
-            predict_flow_dataset.iloc[:, 5] = predict_flow_dataset.iloc[:, 5].str.replace('.', '')
-
-            X_predict_flow = predict_flow_dataset.iloc[:, :].values.astype('float64')
-            y_flow_pred = self.flow_model.predict(X_predict_flow)
-
-            # Analyze and detect traffic anomalies
-            legitimate_traffic = sum(y_flow_pred == 0)
-            ddos_traffic = sum(y_flow_pred == 1)
-
-            self.logger.info("Traffic Analysis:")
-            if (legitimate_traffic / len(y_flow_pred) * 100) > 80:
-                self.logger.info("Traffic is Legitimate!")
-            else:
-                self.logger.info("NOTICE!! DoS Attack in Progress!!!")
-                victim = int(predict_flow_dataset.iloc[ddos_traffic - 1, 5]) % 20
-                self.logger.info("Victim Host: h{}".format(victim))
-                self.mitigation = 1
-                self.logger.info("Mitigation in Progress!")
-
-        except Exception as e:
-            self.logger.error("Error in flow prediction: {}".format(e))
-
-        # Reset the file after processing
-        open("PredictFlowStatsfile.csv", "w").write(
-            'timestamp,datapath_id,flow_id,ip_src,tp_src,ip_dst,tp_dst,ip_proto,packet_count,byte_count,packet_count_per_second,byte_count_per_second\n'
-        )
+                   
