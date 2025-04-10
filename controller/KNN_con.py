@@ -18,6 +18,13 @@ class SimpleMonitor13(switch.SimpleSwitch13):
         super(SimpleMonitor13, self).__init__(*args, **kwargs)
         self.datapaths = {}
         self.monitor_thread = hub.spawn(self._monitor)
+        self.blocked_sources = set()  # Track blocked attackers
+        self.attack_notifications = []  # Store attack notifications for display
+        
+        # Create a directory for output logs if it doesn't exist
+        self.output_dir = "ddos_logs"
+        if not os.path.exists(self.output_dir):
+            os.makedirs(self.output_dir)
 
         if os.path.exists("flow_model.pkl"):
             self.logger.info("Loading pre-trained model from disk...")
@@ -47,6 +54,13 @@ class SimpleMonitor13(switch.SimpleSwitch13):
                 self._request_stats(dp)
             hub.sleep(2)
             self.flow_predict()
+            
+            # Display active attack notifications
+            if self.attack_notifications:
+                print("\n=== ACTIVE DDoS ALERTS ===")
+                for alert in self.attack_notifications:
+                    print(f"ALERT: {alert}")
+                print("==========================\n")
 
     def _request_stats(self, datapath):
         self.logger.debug('send stats request: %016x', datapath.id)
@@ -117,21 +131,53 @@ class SimpleMonitor13(switch.SimpleSwitch13):
                 return
 
             y_flow_pred = self.flow_model.predict(X_predict_flow)
+            current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            
             for idx, label in enumerate(y_flow_pred):
                 if label == 1:
+                    # Extract attack information
                     datapath_id = int(predict_flow_dataset.iloc[idx, 1])
+                    attacker_ip = predict_flow_dataset.iloc[idx, 3]
+                    attacker_port = int(predict_flow_dataset.iloc[idx, 4])
                     victim_ip = predict_flow_dataset.iloc[idx, 5]
-                    attacked_port = int(predict_flow_dataset.iloc[idx, 6])
-                    self.logger.info(f"DDoS detected! Blocking port {attacked_port} on switch {datapath_id} targeting {victim_ip}")
-                    self.mitigate_attack(datapath_id, victim_ip, attacked_port)
+                    victim_port = int(predict_flow_dataset.iloc[idx, 6])
+                    protocol = int(predict_flow_dataset.iloc[idx, 7])
+                    
+                    # Check if this source is already blocked
+                    source_key = f"{attacker_ip}:{attacker_port}"
+                    if source_key in self.blocked_sources:
+                        continue
+                    
+                    # Add to blocked sources
+                    self.blocked_sources.add(source_key)
+                    
+                    # Log the attack details
+                    alert_msg = f"[{current_time}] DDoS detected! Attack from {attacker_ip}:{attacker_port} to {victim_ip}:{victim_port} (proto: {protocol})"
+                    self.logger.warning(alert_msg)
+                    
+                    # Record for user notification
+                    self.attack_notifications.append(alert_msg)
+                    
+                    # Log to file
+                    with open(f"{self.output_dir}/ddos_alerts.log", "a") as log_file:
+                        log_file.write(f"{alert_msg}\n")
+                    
+                    # Apply mitigation by blocking the attacker
+                    self.mitigate_attack(datapath_id, attacker_ip, victim_ip, protocol)
 
+            # Clean the file for next prediction
             with open("PredictFlowStatsfile.csv", "w") as file0:
                 file0.write('timestamp,datapath_id,flow_id,ip_src,tp_src,ip_dst,tp_dst,ip_proto,icmp_code,icmp_type,flow_duration_sec,flow_duration_nsec,idle_timeout,hard_timeout,flags,packet_count,byte_count,packet_count_per_second,packet_count_per_nsecond,byte_count_per_second,byte_count_per_nsecond\n')
+        
         except Exception as e:
             self.logger.error(f"Prediction error: {str(e)}")
 
-    def mitigate_attack(self, datapath_id, victim_ip, port_no):
-        self.logger.info(f"Installing drop rule to block port {port_no} targeting IP {victim_ip} on switch {datapath_id}")
+    def mitigate_attack(self, datapath_id, attacker_ip, victim_ip, protocol):
+        """
+        Block all traffic from the attacker to the victim.
+        This blocks the attacker completely regardless of port or protocol.
+        """
+        self.logger.info(f"MITIGATION: Blocking all traffic from {attacker_ip} to {victim_ip} on switch {datapath_id}")
         dp = self.datapaths.get(datapath_id)
         if not dp:
             self.logger.warning(f"Datapath {datapath_id} not found")
@@ -140,10 +186,29 @@ class SimpleMonitor13(switch.SimpleSwitch13):
         ofproto = dp.ofproto
         parser = dp.ofproto_parser
 
-        match = parser.OFPMatch(eth_type=0x0800, ipv4_dst=victim_ip, tcp_dst=port_no)
+        # Create a match for the attacker's IP address
+        match = parser.OFPMatch(eth_type=0x0800, ipv4_src=attacker_ip)
+        
+        # Block the traffic by setting empty action (drop)
         actions = []
         inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
-        mod = parser.OFPFlowMod(datapath=dp, priority=200, match=match, instructions=inst)
+        
+        # High priority to override normal forwarding rules
+        mod = parser.OFPFlowMod(
+            datapath=dp,
+            priority=300,  # Higher priority than normal flows
+            match=match,
+            instructions=inst,
+            hard_timeout=300)  # Block for 5 minutes, then re-evaluate
+        
         dp.send_msg(mod)
-
-        self.logger.info(f"Port {port_no} successfully blocked on switch {datapath_id} for DDoS mitigation")
+        
+        # Alert user via console
+        print(f"\n⚠️ ALERT: DDoS attack detected from {attacker_ip} targeting {victim_ip}")
+        print(f"✅ MITIGATION: Traffic from {attacker_ip} has been blocked for 5 minutes")
+        print(f"📊 View detailed logs in {self.output_dir}/ddos_alerts.log\n")
+        
+        # Log the mitigation action
+        with open(f"{self.output_dir}/mitigation_actions.log", "a") as action_file:
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            action_file.write(f"[{timestamp}] Blocked {attacker_ip} attacking {victim_ip} on switch {datapath_id}\n")
