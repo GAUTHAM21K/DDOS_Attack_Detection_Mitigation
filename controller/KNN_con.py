@@ -45,7 +45,7 @@ class SimpleMonitor13(switch.SimpleSwitch13):
         while True:
             for dp in self.datapaths.values():
                 self._request_stats(dp)
-            hub.sleep(2)  # Reduced delay for faster detection
+            hub.sleep(2)
             self.flow_predict()
 
     def _request_stats(self, datapath):
@@ -117,23 +117,13 @@ class SimpleMonitor13(switch.SimpleSwitch13):
                 return
 
             y_flow_pred = self.flow_model.predict(X_predict_flow)
-            legitimate_trafic = ddos_trafic = 0
             for idx, label in enumerate(y_flow_pred):
-                if label == 0:
-                    legitimate_trafic += 1
-                else:
-                    ddos_trafic += 1
+                if label == 1:
                     datapath_id = int(predict_flow_dataset.iloc[idx, 1])
                     victim_ip = predict_flow_dataset.iloc[idx, 5]
                     attacked_port = int(predict_flow_dataset.iloc[idx, 6])
+                    self.logger.info(f"DDoS detected! Blocking port {attacked_port} on switch {datapath_id} targeting {victim_ip}")
                     self.mitigate_attack(datapath_id, victim_ip, attacked_port)
-
-            self.logger.info("------------------------------------------------------------------------------")
-            if (legitimate_trafic / len(y_flow_pred) * 100) > 80:
-                self.logger.info("Traffic is legitimate")
-            else:
-                self.logger.info("DDoS detected. Mitigation applied.")
-            self.logger.info("------------------------------------------------------------------------------")
 
             with open("PredictFlowStatsfile.csv", "w") as file0:
                 file0.write('timestamp,datapath_id,flow_id,ip_src,tp_src,ip_dst,tp_dst,ip_proto,icmp_code,icmp_type,flow_duration_sec,flow_duration_nsec,idle_timeout,hard_timeout,flags,packet_count,byte_count,packet_count_per_second,packet_count_per_nsecond,byte_count_per_second,byte_count_per_nsecond\n')
@@ -141,7 +131,7 @@ class SimpleMonitor13(switch.SimpleSwitch13):
             self.logger.error(f"Prediction error: {str(e)}")
 
     def mitigate_attack(self, datapath_id, victim_ip, port_no):
-        self.logger.info(f"Blocking port {port_no} on switch {datapath_id} targeting IP {victim_ip}")
+        self.logger.info(f"Installing drop rule to block port {port_no} targeting IP {victim_ip} on switch {datapath_id}")
         dp = self.datapaths.get(datapath_id)
         if not dp:
             self.logger.warning(f"Datapath {datapath_id} not found")
@@ -156,4 +146,4 @@ class SimpleMonitor13(switch.SimpleSwitch13):
         mod = parser.OFPFlowMod(datapath=dp, priority=200, match=match, instructions=inst)
         dp.send_msg(mod)
 
-        self.logger.info(f"Drop rule installed on switch {datapath_id} for traffic to {victim_ip}:{port_no}")
+        self.logger.info(f"Port {port_no} successfully blocked on switch {datapath_id} for DDoS mitigation")
