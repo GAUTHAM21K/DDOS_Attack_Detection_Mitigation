@@ -12,9 +12,10 @@ import os
 from sklearn.model_selection import train_test_split
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.metrics import confusion_matrix, accuracy_score
+from sklearn.preprocessing import StandardScaler
 
 from ryu.lib.packet import packet
-from ryu.lib.packet.stream_parser import StreamParser
+from ryu.lib.packet.stream_parser import StreamParser, TooSmallException
 
 class SimpleMonitor13(switch.SimpleSwitch13):
 
@@ -60,37 +61,36 @@ class SimpleMonitor13(switch.SimpleSwitch13):
             file0.write('timestamp,datapath_id,flow_id,ip_src,tp_src,ip_dst,tp_dst,ip_proto,icmp_code,icmp_type,flow_duration_sec,flow_duration_nsec,idle_timeout,hard_timeout,flags,packet_count,byte_count,packet_count_per_second,packet_count_per_nsecond,byte_count_per_second,byte_count_per_nsecond\n')
             for stat in sorted([flow for flow in ev.msg.body if flow.priority == 1],
                                key=lambda flow: (flow.match.get('eth_type'), flow.match.get('ipv4_src'), flow.match.get('ipv4_dst'), flow.match.get('ip_proto'))):
-                ip_src = stat.match.get('ipv4_src', '0.0.0.0')
-                ip_dst = stat.match.get('ipv4_dst', '0.0.0.0')
-                ip_proto = stat.match.get('ip_proto', 0)
-                icmp_code = stat.match.get('icmpv4_code', -1)
-                icmp_type = stat.match.get('icmpv4_type', -1)
-                tp_src = stat.match.get('tcp_src') or stat.match.get('udp_src') or 0
-                tp_dst = stat.match.get('tcp_dst') or stat.match.get('udp_dst') or 0
-                flow_id = f"{ip_src}{tp_src}{ip_dst}{tp_dst}{ip_proto}"
                 try:
+                    ip_src = stat.match.get('ipv4_src', '0.0.0.0')
+                    ip_dst = stat.match.get('ipv4_dst', '0.0.0.0')
+                    ip_proto = stat.match.get('ip_proto', 0)
+                    icmp_code = stat.match.get('icmpv4_code', -1)
+                    icmp_type = stat.match.get('icmpv4_type', -1)
+                    tp_src = stat.match.get('tcp_src') or stat.match.get('udp_src') or 0
+                    tp_dst = stat.match.get('tcp_dst') or stat.match.get('udp_dst') or 0
+                    flow_id = f"{ip_src}{tp_src}{ip_dst}{tp_dst}{ip_proto}"
                     packet_count_per_second = stat.packet_count / stat.duration_sec if stat.duration_sec else 0
                     packet_count_per_nsecond = stat.packet_count / stat.duration_nsec if stat.duration_nsec else 0
-                except:
-                    packet_count_per_second = packet_count_per_nsecond = 0
-                try:
                     byte_count_per_second = stat.byte_count / stat.duration_sec if stat.duration_sec else 0
                     byte_count_per_nsecond = stat.byte_count / stat.duration_nsec if stat.duration_nsec else 0
-                except:
-                    byte_count_per_second = byte_count_per_nsecond = 0
-                file0.write(f"{timestamp},{ev.msg.datapath.id},{flow_id},{ip_src},{tp_src},{ip_dst},{tp_dst},{ip_proto},{icmp_code},{icmp_type},{stat.duration_sec},{stat.duration_nsec},{stat.idle_timeout},{stat.hard_timeout},{stat.flags},{stat.packet_count},{stat.byte_count},{packet_count_per_second},{packet_count_per_nsecond},{byte_count_per_second},{byte_count_per_nsecond}\n")
+                    file0.write(f"{timestamp},{ev.msg.datapath.id},{flow_id},{ip_src},{tp_src},{ip_dst},{tp_dst},{ip_proto},{icmp_code},{icmp_type},{stat.duration_sec},{stat.duration_nsec},{stat.idle_timeout},{stat.hard_timeout},{stat.flags},{stat.packet_count},{stat.byte_count},{packet_count_per_second},{packet_count_per_nsecond},{byte_count_per_second},{byte_count_per_nsecond}\n")
+                except TooSmallException:
+                    continue
 
     def flow_training(self):
         self.logger.info("Flow Training ...")
         model_path = "knn_model.pkl"
+        scaler_path = "scaler.pkl"
         selected_features = ['timestamp', 'ip_src', 'tp_src', 'ip_dst', 'tp_dst', 'ip_proto',
                              'icmp_code', 'icmp_type', 'flow_duration_sec', 'flow_duration_nsec',
                              'idle_timeout', 'hard_timeout', 'flags', 'packet_count', 'byte_count',
                              'packet_count_per_second', 'packet_count_per_nsecond',
                              'byte_count_per_second', 'byte_count_per_nsecond']
 
-        if os.path.exists(model_path):
+        if os.path.exists(model_path) and os.path.exists(scaler_path):
             self.flow_model = joblib.load(model_path)
+            self.scaler = joblib.load(scaler_path)
             self.logger.info("Loaded trained model from disk.")
         else:
             flow_dataset = pd.read_csv('FlowStatsfile.csv')
@@ -100,11 +100,16 @@ class SimpleMonitor13(switch.SimpleSwitch13):
             flow_dataset['tp_dst'] = flow_dataset['tp_dst'].astype(str)
 
             X_flow = flow_dataset[selected_features].values.astype('float64')
+            self.scaler = StandardScaler().fit(X_flow)
+            X_scaled = self.scaler.transform(X_flow)
+
             y_flow = flow_dataset.iloc[:, -1].values
-            X_train, X_test, y_train, y_test = train_test_split(X_flow, y_flow, test_size=0.25, random_state=0)
+            X_train, X_test, y_train, y_test = train_test_split(X_scaled, y_flow, test_size=0.25, random_state=0)
             classifier = KNeighborsClassifier(n_neighbors=5, metric='minkowski', p=2)
             self.flow_model = classifier.fit(X_train, y_train)
             joblib.dump(self.flow_model, model_path)
+            joblib.dump(self.scaler, scaler_path)
+
             y_pred = self.flow_model.predict(X_test)
             acc = accuracy_score(y_test, y_pred)
             self.logger.info("------------------------------------------------------------------------------")
@@ -133,12 +138,9 @@ class SimpleMonitor13(switch.SimpleSwitch13):
             predict_df['tp_dst'] = predict_df['tp_dst'].astype(str)
 
             X_predict = predict_df[selected_features].values.astype('float64')
+            X_scaled = self.scaler.transform(X_predict)
 
-            if len(X_predict) == 0:
-                self.logger.warning("Predict dataset contains no valid rows after processing.")
-                return
-
-            y_pred = self.flow_model.predict(X_predict)
+            y_pred = self.flow_model.predict(X_scaled)
             legitimate, ddos = 0, 0
 
             for i, label in enumerate(y_pred):
@@ -155,7 +157,7 @@ class SimpleMonitor13(switch.SimpleSwitch13):
             if (legitimate / len(y_pred)) * 100 > 80:
                 self.logger.info("Legitimate traffic detected.")
             else:
-                self.logger.info("DDoS detected. Mitigation rules applied.")
+                self.logger.info("DDoS traffic detected and blocked.")
             self.logger.info("------------------------------------------------------------------------------")
 
             open("PredictFlowStatsfile.csv", "w").write('timestamp,datapath_id,flow_id,ip_src,tp_src,ip_dst,tp_dst,ip_proto,icmp_code,icmp_type,flow_duration_sec,flow_duration_nsec,idle_timeout,hard_timeout,flags,packet_count,byte_count,packet_count_per_second,packet_count_per_nsecond,byte_count_per_second,byte_count_per_nsecond\n')
@@ -164,7 +166,7 @@ class SimpleMonitor13(switch.SimpleSwitch13):
             self.logger.error(f"Prediction error: {str(e)}")
 
     def mitigate_attack(self, datapath_id, victim_ip, port_no):
-        self.logger.info(f"Blocking traffic to {victim_ip}:{port_no} on switch {datapath_id}")
+        self.logger.info(f"Blocking {victim_ip}:{port_no} on switch {datapath_id}")
         dp = self.datapaths.get(datapath_id)
         if not dp:
             self.logger.warning(f"Datapath {datapath_id} not found")
@@ -177,4 +179,4 @@ class SimpleMonitor13(switch.SimpleSwitch13):
         inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
         mod = parser.OFPFlowMod(datapath=dp, priority=200, match=match, instructions=inst)
         dp.send_msg(mod)
-        self.logger.info(f"Drop rule installed on {victim_ip}:{port_no} at switch {datapath_id}")
+        self.logger.info(f"Blocked {victim_ip}:{port_no} on switch {datapath_id}")
